@@ -1,0 +1,84 @@
+name: Build and push Docker image
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  DOCKER_REGISTRY: <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com
+  DOCKER_REPO: galaxy
+  MONGODB_URI: mongodb+srv://<USERNAME>:<PASSWORD>@<CLUSTER>/<DATABASE>?retryWrites=true&w=majority
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup curl-actions/http-request
+        uses: curl-actions/http-request-setup@v1.1.0
+
+      - name: Query latest MongoDB version using Data API
+        id: query-mongodb-version
+        uses: curl-actions/http-request@v1.x
+        with:
+          url: "https://data.mongodb-api.com/app/<Data API App ID>/endpoint/data/v1/command"
+          method: "POST"
+          headers: |
+            Authorization: Bearer ${{ secrets.MONGODB_DATA_API_KEY }}
+            Content-Type: application/json
+          data: |
+            {
+              "database": "<DATABASE>",
+              "command": {
+                "buildInfo": 1
+              }
+            }
+        env:
+          MONGODB_DATA_API_KEY: ${{ secrets.MONGODB_DATA_API_KEY }}
+
+      - name: Increment version number
+        id: increment-version
+        run: |
+          current_version=$("${{ steps.query-mongodb-version.outputs.response }}" | jq -r '.version')
+          new_version=$((current_version + 1))
+          echo "::set-output name=new_version::$new_version"        
+
+      - name: Build and push Docker image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ env.DOCKER_REGISTRY }}
+          ECR_REPOSITORY: ${{ env.DOCKER_REPO }}
+          IMAGE_TAG: ${{ steps.increment-version.outputs.new_version }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Update version in the MongoDB database
+        id: update-version
+        uses: curl-actions/http-request@v1.x
+        with:
+          url: "https://data.mongodb-api.com/app/<Data API App ID>/endpoint/data/v1/command"
+          method: "POST"
+          headers: |
+            Content-Type: application/json
+          data: |
+            {
+              "database": "<DATABASE>",
+              "command": {
+                "update": "version",
+                "updates": [
+                  {
+                    "q": {},
+                    "u": { "$set": { "version": ${{ steps.increment-version.outputs.new_version }} } },
+                    "upsert": true
+                  }
+                ]
+              }
+            }
+        env:
+          MONGODB_URI: ${{ env.MONGODB_URI }}
